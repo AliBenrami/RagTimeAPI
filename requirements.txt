@@ -1,0 +1,6 @@
+fastapi
+chromadb
+sentence_transformers
+PyMuPDF
+python-multipart
+dotenv
