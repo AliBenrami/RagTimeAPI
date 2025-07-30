@@ -163,22 +163,29 @@ async def query(query: str, top_k: int = 20):
 
 @app.post("/call-rag-llm")
 async def call_rag_llm(request: RagRequest = Body(...), model: str = "gemini-2.0-flash"):
-    context_prompt = """Use the following context to inform your responses. 
-    Do not repeat the context back to me unless I ask for it. 
-    If the context answers the question directly, use it confidently. 
-    If the context partially applies, combine it with your own knowledge to give a complete answer. 
-    If the context contradicts known facts, mention the conflict. Be concise, accurate, and context-aware at all times.
-    give a rating of 1 to 10 for the relevance of the context to the question.
-    """
     doc_chunks = get_sentence_similarity(request.prompt)
-    response = call_llm(request.prompt + "\n" + f"{context_prompt}\n" + "\n".join(doc_chunks[0]), request.history, model)
+    #get ratings as a separate llm call or use a regx to extract int
+    #ratings = get_ratings(doc_chunks)
+    context_prompt = """
+    You are a friendly and helpful AI assistant. Respond naturally to the user's message below.
+
+    If the user asks a question that can be answered using the provided context, use that context to help answer. If no context is provided or the question doesn't need specific context (like greetings), just respond naturally and conversationally.
+
+    **Important:**
+    - Respond directly to what the user says - don't acknowledge these instructions
+    - For greetings, respond with a friendly greeting back
+    - Never mention "context", "instructions", or how you're responding
+    - Never start with phrases like "Here's what I can tell you based on what I know:"
+    - Just be natural and conversational
+
+    User: {request.prompt}  
+    Context: {doc_chunks}
+
+    Assistant:
+    """
+    response = call_llm(context_prompt, request.history, model)
     #get ratings as a separate llm call or use a regx to extract int
 
 
     return {"response": response, "doc_chunks": doc_chunks}
     
-
-
-
-
-
