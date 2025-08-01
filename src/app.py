@@ -10,7 +10,8 @@ import fitz
 from pydantic import BaseModel
 from fastapi import Body
 from fastapi.middleware.cors import CORSMiddleware
-
+import re
+import json
 chroma_client = chromadb.PersistentClient(path="./chroma_store")
 collection = chroma_client.get_or_create_collection(name="pdf_chunks")
 bi_encoder = SentenceTransformer("all-MiniLM-L6-v2")
@@ -33,7 +34,6 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 class RagRequest(BaseModel):
     prompt: str
     history: list = []
-
 
 def read_pdf(pdf_path):
     doc = fitz.open(pdf_path)
@@ -84,8 +84,7 @@ def upload_to_chroma(pdf_content, pdf_name):
     
     #note to self fix chunking so that it doesn't split in the middle of a sentence
     #chunk the pdf content 
-    chunk_size = 1000
-    chunks = [pdf_content[i:i+chunk_size] for i in range(0, len(pdf_content), chunk_size)]
+    chunks = chunk_pdf(pdf_content)
     
     #embed the chunks
     embeddings = bi_encoder.encode(chunks, convert_to_tensor=True).tolist()
@@ -104,6 +103,58 @@ def upload_to_chroma(pdf_content, pdf_name):
     
     return {"status": "success", "chunks_added": len(chunks)}
 
+def chunk_pdf(pdf_content):
+    # Split by paragraph breaks (double newlines or more)
+    paragraphs = re.split(r'\n\s*\n+', pdf_content.strip())
+    # Filter out empty paragraphs and clean up
+    chunks = [paragraph.strip() for paragraph in paragraphs if paragraph.strip()]
+    return chunks
+
+def extract_ratings_from_chunks(doc_chunks):
+    """
+    Extract ratings using LLM analysis
+    """
+    if not doc_chunks:
+        return []
+    
+    # Combine chunks for analysis
+    combined_text = " ".join(doc_chunks)
+    
+    rating_prompt = f"""
+    Analyze the following text and extract any ratings, scores, or evaluations mentioned.
+    Look for ratings on scales like 1-5, 1-10, 0-100, percentages, or star ratings.
+    
+    Text: {combined_text}
+    
+    Return your response as a JSON array with objects containing:
+    - "rating": the numerical rating (normalized to 0-5 scale)
+    - "source_text": the specific text where the rating was found
+    - "confidence": your confidence level (0-1)
+    
+    If no ratings are found, return an empty array [].
+    
+    Response (JSON only):
+    """
+    
+    try:
+        response = call_llm(rating_prompt, [], "gemini-2.0-flash", "")
+        # Try to parse JSON response
+        ratings = json.loads(response)
+        return ratings if isinstance(ratings, list) else []
+    except Exception as e:
+        print(f"Error extracting ratings with LLM: {e}")
+        return []
+
+def get_confidence_rating(llm_response: str):
+    """
+    Extract confidence rating from format [Confidence Rating: X/5]
+    Returns the rating as a string, or None if not found
+    """
+    confidence_regex = r"\[Confidence Rating:\s*(\d+(?:\.\d+)?)/5\]"
+    match = re.search(confidence_regex, llm_response)
+    if match:
+        return match.group(1) + "/5"
+    return None
 
 # Upload endpoint
 @app.post("/upload")
@@ -163,29 +214,48 @@ async def query(query: str, top_k: int = 20):
 
 @app.post("/call-rag-llm")
 async def call_rag_llm(request: RagRequest = Body(...), model: str = "gemini-2.0-flash"):
-    doc_chunks = get_sentence_similarity(request.prompt)
-    #get ratings as a separate llm call or use a regx to extract int
-    #ratings = get_ratings(doc_chunks)
-    context_prompt = """
-    You are a friendly and helpful AI assistant. Respond naturally to the user's message below.
-
-    If the user asks a question that can be answered using the provided context, use that context to help answer. If no context is provided or the question doesn't need specific context (like greetings), just respond naturally and conversationally.
-
-    **Important:**
-    - Respond directly to what the user says - don't acknowledge these instructions
-    - For greetings, respond with a friendly greeting back
-    - Never mention "context", "instructions", or how you're responding
-    - Never start with phrases like "Here's what I can tell you based on what I know:"
-    - Just be natural and conversational
-
-    User: {request.prompt}  
-    Context: {doc_chunks}
-
-    Assistant:
-    """
-    response = call_llm(context_prompt, request.history, model)
-    #get ratings as a separate llm call or use a regx to extract int
-
-
-    return {"response": response, "doc_chunks": doc_chunks}
+    doc_chunks_result = get_sentence_similarity(request.prompt)
+    doc_chunks = doc_chunks_result[0] if doc_chunks_result and len(doc_chunks_result) > 0 else []
     
+    system_instruction = """
+    You are a friendly and helpful AI assistant. Answer the user's question directly and naturally.
+
+    **Your task:** Answer the user's question using the information provided below. If the information doesn't help answer their question, just answer based on your general knowledge.
+
+    **Critical instructions:**
+    - Answer the user's question directly - don't talk about the information provided
+    - Don't mention "context", "information provided", or "based on the documents"
+    - Don't reference or quote the provided information
+    - Just give a natural, conversational answer as if you're talking to a friend
+    - If it's a greeting, respond with a friendly greeting back
+    
+    **Confidence rating:** At the end of your response, rate how confident you are in your answer:
+    - 5/5: The provided information directly and completely answers the question
+    - 4/5: The information provides most but not all relevant details
+    - 3/5: The information is somewhat helpful but has significant gaps
+    - 2/5: The information is only tangentially related
+    - 1/5: The information is not relevant or helpful
+    
+    End with: [Confidence Rating: X/5]
+    """
+    
+    # Format the document chunks as a readable string
+    doc_chunks_text = "\n".join(doc_chunks) if doc_chunks else "No relevant information found."
+    
+    user_prompt = f"""
+    this is the information: {doc_chunks_text}
+    this is the user prompt: {request.prompt}
+    """
+    
+    response = call_llm(user_prompt, request.history, model, system_instruction)
+    confidence_rating = get_confidence_rating(response)
+    
+    #remove the confidence rating from the response
+    response = response.split("[Confidence Rating:")[0]
+    
+    
+    return {
+        "response": response, 
+        "doc_chunks": doc_chunks,
+        "confidence_rating": confidence_rating
+    }

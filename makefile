@@ -1,4 +1,7 @@
 app:
-		fastapi dev app.py
+	fastapi dev src/app.py
+
+test:
+	pytest src/test.py
 
 
